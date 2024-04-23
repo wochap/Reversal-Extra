@@ -1,0 +1,14 @@
+[Icon Theme]
+Name=Reversal Extra
+Inherits=Reversal,Numix-Circle-Light,Adwaita,hicolor
+
+Directories=apps/scalable
+
+[apps/scalable]
+Size=64
+Scale=2
+Context=Applications
+MinSize=16
+MaxSize=512
+Type=Scalable
+
