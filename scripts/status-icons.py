@@ -1,28 +1,27 @@
 #!/usr/bin/env nix-shell
 #! nix-shell -i python3 -p python3 resvg
 """
-Keep Reversal-Extra's status icons in one folder, status/scalable, where every
-icon renders at the same visible size.
+Normalize the viewBox of Reversal-Extra's status icons so every icon in a size
+folder renders at the same visible size.
 
-Icon themes ship status icons in several size folders (16, 22, 24, 32,
-symbolic) whose drawings have different padding, so the same icon renders at a
-different visible size depending on the requested size. Normalizing fixes that:
-each SVG is rendered with resvg, the bounding box of its visible pixels is
-measured, and the root <svg> gets a square viewBox centered on that box, sized
-so the shape's longest side is RATIO of the canvas. Running it again on
-normalized icons changes nothing.
+The status folders (status/16, 22, 24, 32, symbolic) come from another theme
+whose drawings use different padding: in status/24 one shape is 14x12, another
+20x16, and symbolic icons fill the whole canvas. Normalizing fixes that per
+folder: each SVG is rendered with resvg, the bounding box of its visible pixels
+is measured, and the root <svg> gets a square viewBox centered on that box,
+sized so the shape's longest side is RATIO of the folder's canvas (the Size= of
+its index.theme section). Running it again on normalized icons changes nothing.
 
 Commands:
-  import <theme-dir>   Replace status/scalable with the status icons of another
-                       theme (folders merged in SOURCE_DIRS order, first match
-                       wins), rewrite index.theme, then normalize.
-  normalize            Normalize every SVG in status/scalable in place. Run this
-                       after adding or editing icons.
+  normalize            Normalize every status folder in place. Run this after
+                       adding or editing icons.
+  import <theme-dir>   Replace the status folders, their @2x/@3x links and their
+                       index.theme sections with another theme's, then normalize.
 
 Usage:
-  ./scripts/status-icons.py import ~/Sandboxes/sandbox/vendor/Colloid-icon-theme/build/Colloid
   ./scripts/status-icons.py normalize
   ./scripts/status-icons.py normalize --ratio 0.75
+  ./scripts/status-icons.py import ~/Sandboxes/sandbox/vendor/Colloid-icon-theme/build/Colloid
 """
 
 import argparse
@@ -37,22 +36,10 @@ import tempfile
 import zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE_DIRS = ["22", "24", "16", "32", "symbolic"]
-OUT_DIR = "status/scalable"
-CANVAS = 24
 RENDER_WIDTH = 256
 # Re-normalizing measures the bbox again with pixel rounding; viewBoxes that
 # differ by less than this fraction of their side are kept as-is
 TOLERANCE = 0.02
-
-STATUS_SECTION = f"""[{OUT_DIR}]
-Size={CANVAS}
-Context=Status
-MinSize=8
-MaxSize=512
-Type=Scalable
-"""
-
 
 def read_png_alpha_bbox(path):
     """Return (width, height, bbox) of a RGBA8 PNG, bbox = (x0, y0, x1, y1) or None."""
@@ -114,7 +101,7 @@ def parse_length(value):
     return float(match.group(1)) if match else None
 
 
-def normalize(src, ratio):
+def normalize(src, ratio, canvas):
     """Return the normalized SVG text of `src`, or None when it renders empty."""
     text = open(src, encoding="utf-8").read()
     root = re.search(r"<svg\b[^>]*>", text)
@@ -154,42 +141,33 @@ def normalize(src, ratio):
     new_tag = re.sub(r"""\s(width|height|viewBox|preserveAspectRatio)=("[^"]*"|'[^']*')""", "", tag)
     new_tag = new_tag.replace(
         "<svg",
-        f'<svg width="{CANVAS}" height="{CANVAS}" '
+        f'<svg width="{canvas}" height="{canvas}" '
         'viewBox="{:.4f} {:.4f} {:.4f} {:.4f}"'.format(*new_box),
         1,
     )
     return text[:root.start()] + new_tag + text[root.end():]
 
 
-def collect(theme):
-    """Map icon file name -> real source path, first SOURCE_DIRS match wins."""
-    chosen = {}
-    for sub in SOURCE_DIRS:
-        folder = os.path.join(theme, "status", sub)
-        if not os.path.isdir(folder):
-            continue
-        for name in sorted(os.listdir(folder)):
-            path = os.path.join(folder, name)
-            if name.endswith(".svg") and name not in chosen and os.path.exists(path):
-                chosen[name] = os.path.realpath(path)
-    return chosen
+def theme_sections(text):
+    """Split index.theme text into (name, body) pairs, name None for the preamble."""
+    sections = []
+    for chunk in re.split(r"\n(?=\[)", text.strip()):
+        match = re.match(r"\[([^\]]+)\]", chunk)
+        sections.append((match.group(1) if match else None, chunk.strip()))
+    return sections
 
 
-def write_index_theme():
-    path = os.path.join(REPO, "index.theme")
-    text = open(path, encoding="utf-8").read()
-    sections = re.split(r"\n(?=\[)", text.strip())
-    kept = [s for s in sections if not s.startswith("[status")]
-    dirs = []
-    for s in kept[1:]:
-        dirs.append(s.split("]", 1)[0][1:])
-    dirs.append(OUT_DIR)
-    kept[0] = re.sub(r"^Directories=.*$", "Directories=" + ",".join(dirs), kept[0], flags=re.M)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(s.strip() for s in kept) + "\n\n" + STATUS_SECTION)
+def status_folders():
+    """Map status folder -> canvas size, from index.theme (the @2x/@3x links are skipped)."""
+    folders = {}
+    for name, body in theme_sections(open(os.path.join(REPO, "index.theme"), encoding="utf-8").read()):
+        if name and name.startswith("status/"):
+            size = re.search(r"^Size=(\d+)", body, re.M)
+            folders[name] = int(size.group(1))
+    return folders
 
 
-def normalize_folder(folder, ratio):
+def normalize_folder(folder, ratio, canvas):
     """Normalize every regular SVG in `folder` in place (symlinks are aliases, left alone)."""
     paths = sorted(
         os.path.join(folder, name)
@@ -198,7 +176,7 @@ def normalize_folder(folder, ratio):
     )
     changed, empty, failed = 0, 0, []
     with concurrent.futures.ProcessPoolExecutor() as pool:
-        futures = {path: pool.submit(normalize, path, ratio) for path in paths}
+        futures = {path: pool.submit(normalize, path, ratio, canvas) for path in paths}
         for path, future in futures.items():
             try:
                 content = future.result()
@@ -212,17 +190,17 @@ def normalize_folder(folder, ratio):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
                 changed += 1
-    print(f"{os.path.relpath(folder, REPO)}: {len(paths)} icons, {changed} changed, {empty} empty (skipped)")
+    print(f"{os.path.relpath(folder, REPO)} ({canvas}px): {len(paths)} icons, {changed} changed, {empty} empty (skipped)")
     for path, error in failed:
         print(f"  failed: {os.path.relpath(path, REPO)}: {error}", file=sys.stderr)
     return not failed
 
 
 def import_theme(theme):
-    """Replace status/scalable with the raw status icons of `theme`."""
-    chosen = collect(theme)
-    if not chosen:
-        sys.exit(f"no status icons found in {theme}/status/{{{','.join(SOURCE_DIRS)}}}")
+    """Replace the status folders, @2x/@3x links and index.theme sections with `theme`'s."""
+    source = os.path.join(theme, "status")
+    if not os.path.isdir(source):
+        sys.exit(f"no status folder in {theme}")
 
     for stale in ("status", "status@2x", "status@3x"):
         path = os.path.join(REPO, stale)
@@ -230,19 +208,31 @@ def import_theme(theme):
             os.remove(path)
         elif os.path.isdir(path):
             shutil.rmtree(path)
-    out = os.path.join(REPO, OUT_DIR)
-    os.makedirs(out)
 
-    # Aliases of the same real file become symlinks to the first name
-    first_name = {}
-    for name, real in chosen.items():
-        if real in first_name:
-            os.symlink(first_name[real], os.path.join(out, name))
-        else:
-            first_name[real] = name
-            shutil.copyfile(real, os.path.join(out, name))
-    write_index_theme()
-    print(f"{OUT_DIR}: imported {len(first_name)} icons, {len(chosen) - len(first_name)} aliases")
+    # Keep links inside status/, copy the files behind links that leave it
+    out = os.path.join(REPO, "status")
+    shutil.copytree(os.path.realpath(source), out, symlinks=True)
+    for folder, _, names in os.walk(out):
+        for name in names:
+            path = os.path.join(folder, name)
+            if os.path.islink(path) and "/" in os.readlink(path):
+                target = os.path.join(os.path.realpath(source), os.path.relpath(path, out))
+                os.remove(path)
+                shutil.copyfile(os.path.realpath(target), path)
+    for scale in ("status@2x", "status@3x"):
+        if os.path.lexists(os.path.join(theme, scale)):
+            os.symlink("status", os.path.join(REPO, scale))
+
+    # index.theme: drop our status sections, append the source theme's
+    path = os.path.join(REPO, "index.theme")
+    ours = [s for s in theme_sections(open(path, encoding="utf-8").read()) if not (s[0] or "").startswith("status")]
+    theirs = [s for s in theme_sections(open(os.path.join(theme, "index.theme"), encoding="utf-8").read())
+              if (s[0] or "").startswith("status")]
+    dirs = [name for name, _ in ours[1:] + theirs]
+    preamble = re.sub(r"^Directories=.*$", "Directories=" + ",".join(dirs), ours[0][1], flags=re.M)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join([preamble] + [body for _, body in ours[1:] + theirs]) + "\n")
+    print(f"imported status folders from {theme}")
 
 
 def main():
@@ -251,14 +241,16 @@ def main():
                         help="longest side of the shape relative to the canvas (default 16/24)")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    import_parser = commands.add_parser("import", parents=[common], help="import status icons from another theme")
-    import_parser.add_argument("theme", help="source icon theme directory (contains status/)")
-    commands.add_parser("normalize", parents=[common], help="normalize status/scalable in place")
+    commands.add_parser("normalize", parents=[common], help="normalize every status folder in place")
+    import_parser = commands.add_parser("import", parents=[common], help="import status folders from another theme")
+    import_parser.add_argument("theme", help="source icon theme directory (contains status/ and index.theme)")
     args = parser.parse_args()
 
     if args.command == "import":
         import_theme(args.theme)
-    ok = normalize_folder(os.path.join(REPO, OUT_DIR), args.ratio)
+    ok = True
+    for folder, canvas in status_folders().items():
+        ok = normalize_folder(os.path.join(REPO, folder), args.ratio, canvas) and ok
     sys.exit(0 if ok else 1)
 
 
